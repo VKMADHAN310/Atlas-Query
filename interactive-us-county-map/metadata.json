@@ -1,0 +1,5 @@
+{
+  "name": "Interactive US County Map",
+  "description": "An interactive map of United States counties built with React and D3. Hover over counties to highlight them and click to see more information. This application is designed to be a foundation for visualizing county-level data.",
+  "requestFramePermissions": []
+}

@@ -1,0 +1,44 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+.mypy_cache/
+
+# Virtual envs
+venv/
+.env/
+.myenv/
+myenv/
+
+# Env file
+.env
+
+# Logs
+logs/*
+!logs/.gitkeep
+
+# Node.js / Frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+dist/
+dist-ssr/
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
