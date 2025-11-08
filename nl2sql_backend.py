@@ -46,6 +46,23 @@ SCHEMA_TEXT = (
     "geom geometry(MULTIPOLYGON,4269))"
 )
 
+# Minimal mapping from full state name -> USPS 2-letter code for fallback visualization
+STATE_NAME_TO_ABBR = {
+    "ALABAMA": "AL", "ALASKA": "AK", "ARIZONA": "AZ", "ARKANSAS": "AR",
+    "CALIFORNIA": "CA", "COLORADO": "CO", "CONNECTICUT": "CT", "DELAWARE": "DE",
+    "FLORIDA": "FL", "GEORGIA": "GA", "HAWAII": "HI", "IDAHO": "ID",
+    "ILLINOIS": "IL", "INDIANA": "IN", "IOWA": "IA", "KANSAS": "KS",
+    "KENTUCKY": "KY", "LOUISIANA": "LA", "MAINE": "ME", "MARYLAND": "MD",
+    "MASSACHUSETTS": "MA", "MICHIGAN": "MI", "MINNESOTA": "MN", "MISSISSIPPI": "MS",
+    "MISSOURI": "MO", "MONTANA": "MT", "NEBRASKA": "NE", "NEVADA": "NV",
+    "NEW HAMPSHIRE": "NH", "NEW JERSEY": "NJ", "NEW MEXICO": "NM", "NEW YORK": "NY",
+    "NORTH CAROLINA": "NC", "NORTH DAKOTA": "ND", "OHIO": "OH", "OKLAHOMA": "OK",
+    "OREGON": "OR", "PENNSYLVANIA": "PA", "RHODE ISLAND": "RI", "SOUTH CAROLINA": "SC",
+    "SOUTH DAKOTA": "SD", "TENNESSEE": "TN", "TEXAS": "TX", "UTAH": "UT",
+    "VERMONT": "VT", "VIRGINIA": "VA", "WASHINGTON": "WA", "WEST VIRGINIA": "WV",
+    "WISCONSIN": "WI", "WYOMING": "WY", "DISTRICT OF COLUMBIA": "DC"
+}
+
 # Early filter for out-of-scope prompts (non US regions, provinces, etc.)
 OOS_PATTERNS = [
     r"\bcanada\b",
@@ -89,8 +106,11 @@ class Answer(BaseModel):
     scope_rejected: bool = False
 
 
-def answer_for_rows(rows: List[Dict[str, Any]], sql: str, db_ms: int) -> Answer:
-    """Helper to build a standard Answer for direct DB queries (no LM)."""
+def answer_for_rows(rows: List[Dict[str, Any]], sql: str, db_ms: int, lm_ms: int = 0) -> Answer:
+    """Helper to build a standard Answer for DB-backed results.
+    lm_ms defaults to 0 for endpoints that do not call the LM, but callers can
+    pass through the actual LM time (e.g., when a visualization fallback runs).
+    """
     has_geojson = bool(rows) and isinstance(rows[0], dict) and ("geojson" in rows[0])
     preview = rows if (has_geojson and len(rows) <= 500) else rows[:20]
     return Answer(
@@ -98,7 +118,7 @@ def answer_for_rows(rows: List[Dict[str, Any]], sql: str, db_ms: int) -> Answer:
         rows_preview=preview,
         rows_total=len(rows),
         sql=sql,
-        lm_ms=0,
+        lm_ms=lm_ms,
         db_ms=db_ms,
     )
 
@@ -163,9 +183,23 @@ def call_lm(system: str, prompt: str, *, model: Optional[str] = None, provider: 
     return txt, ms, eff_model
 
 
+def safe_call_lm(system: str, prompt: str, *, model: Optional[str] = None, provider: Optional[str] = None) -> Tuple[str, int, str]:
+    """Call LM and validate return shape to avoid None unpacking issues."""
+    res = call_lm(system, prompt, model=model, provider=provider)
+    if not res or not isinstance(res, tuple) or len(res) != 3:
+        raise RuntimeError("LM provider returned unexpected result")
+    return res
+
+
 def strip_code_fences(s: str) -> str:
     """Remove ```sql fences LMs sometimes include around SQL."""
     s = s.strip()
+    # If the LM returned prose plus a fenced SQL block, extract the first fenced block
+    m = re.search(r"```(?:sql)?\s*(.*?)\s*```", s, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+
+    # Otherwise remove leading/trailing fences when the whole string is fenced
     s = re.sub(r"^```(?:sql)?", "", s, flags=re.IGNORECASE).strip()
     s = re.sub(r"```$", "", s).strip()
     return s
@@ -241,12 +275,12 @@ def add_geom_to_spatial_count_query(sql: str, nl_query: str) -> Tuple[str, bool]
     alias_b = join_match.group(1)
     join_condition = join_match.group(2).strip()
     
-    # Extract FROM clause alias
-    from_match = re.search(r"FROM\s+counties\s+(\w+)", sql, flags=re.IGNORECASE)
-    if not from_match:
-        return sql, False
-    
-    alias_a = from_match.group(1)
+    # Extract FROM clause alias safely (only if a proper alias is present)
+    from_match = re.search(r"FROM\s+counties\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:JOIN|WHERE|ORDER|GROUP|HAVING|LIMIT|UNION)", sql, flags=re.IGNORECASE)
+    if from_match:
+        alias_a = from_match.group(1)
+    else:
+        alias_a = None
     
     # Extract WHERE clause
     where_match = re.search(r"WHERE\s+(.+?)(?:\s+GROUP\s+BY|\s+ORDER\s+BY|\s*$)", sql, flags=re.IGNORECASE | re.DOTALL)
@@ -254,19 +288,24 @@ def add_geom_to_spatial_count_query(sql: str, nl_query: str) -> Tuple[str, bool]
     
     # Build new query: return both the source county and its neighbors with geometry
     if where_clause:
-        new_sql = f"""SELECT {alias_a}.namelsad, {alias_a}.stateaabrv, {alias_a}.geoid, {alias_a}.geom, 'source' AS county_type
-FROM counties {alias_a}
-WHERE {where_clause}
-UNION ALL
-SELECT {alias_b}.namelsad, {alias_b}.stateaabrv, {alias_b}.geoid, {alias_b}.geom, 'neighbor' AS county_type
-FROM counties {alias_a} JOIN counties {alias_b} ON {join_condition}
-WHERE {where_clause}
-GROUP BY {alias_b}.geoid, {alias_b}.namelsad, {alias_b}.stateaabrv, {alias_b}.geom"""
+        if alias_a:
+            src = f"{alias_a}.namelsad, {alias_a}.stateaabrv, {alias_a}.geoid, {alias_a}.geom"
+            from_src = f"FROM counties {alias_a}\nWHERE {where_clause}"
+        else:
+            src = "namelsad, stateaabrv, geoid, geom"
+            from_src = f"FROM counties WHERE {where_clause}"
+
+        new_sql = (
+            f"SELECT {src}, 'source' AS county_type\n{from_src}\n"
+            f"UNION ALL\n"
+            f"SELECT {alias_b}.namelsad, {alias_b}.stateaabrv, {alias_b}.geoid, {alias_b}.geom, 'neighbor' AS county_type\n"
+            f"FROM counties {alias_a if alias_a else ''} JOIN counties {alias_b} ON {join_condition}\n"
+            f"WHERE {where_clause}\n"
+            f"GROUP BY {alias_b}.geoid, {alias_b}.namelsad, {alias_b}.stateaabrv, {alias_b}.geom"
+        )
     else:
         # No WHERE clause - return all neighbors
-        new_sql = f"""SELECT {alias_b}.namelsad, {alias_b}.stateaabrv, {alias_b}.geoid, {alias_b}.geom, 'neighbor' AS county_type
-FROM counties {alias_a} JOIN counties {alias_b} ON {join_condition}
-GROUP BY {alias_b}.geoid, {alias_b}.namelsad, {alias_b}.stateaabrv, {alias_b}.geom"""
+        new_sql = f"SELECT {alias_b}.namelsad, {alias_b}.stateaabrv, {alias_b}.geoid, {alias_b}.geom, 'neighbor' AS county_type\nFROM counties {alias_a if alias_a else ''} JOIN counties {alias_b} ON {join_condition}\nGROUP BY {alias_b}.geoid, {alias_b}.namelsad, {alias_b}.stateaabrv, {alias_b}.geom"
     
     return new_sql, True
 
@@ -289,12 +328,18 @@ def convert_simple_count_to_rows(sql: str) -> Tuple[str, bool]:
     if re.search(r"\bGROUP\s+BY\b", sql, flags=re.IGNORECASE):
         return sql, False
 
-    # Capture optional alias after FROM counties
-    m_from = re.search(r"(?is)\bFROM\s+counties\s*([a-zA-Z_][a-zA-Z0-9_]*)?", sql)
-    if not m_from:
-        return sql, False
+    # Capture optional alias after FROM counties, but don't accidentally capture SQL keywords like WHERE
+    # Prefer patterns where an alias is followed by SQL keywords; otherwise treat as no alias.
+    m_from_alias = re.search(r"FROM\s+counties\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:JOIN|WHERE|ORDER|GROUP|HAVING|LIMIT|UNION)", sql, flags=re.IGNORECASE)
+    if m_from_alias:
+        alias = m_from_alias.group(1)
+    else:
+        # If no explicit alias pattern matched, check for a bare FROM counties (no alias)
+        m_from_bare = re.search(r"(?is)\bFROM\s+counties\b", sql)
+        if not m_from_bare:
+            return sql, False
+        alias = None
 
-    alias = m_from.group(1)
     alias_prefix = f"{alias}." if alias else ""
 
     # Extract WHERE clause (up to GROUP BY/ORDER BY/LIMIT or end)
@@ -368,7 +413,8 @@ def fix_distinct_with_json(sql: str) -> Tuple[str, bool]:
     if not re.search(r"\bSELECT\s+DISTINCT\b", sql, flags=re.IGNORECASE):
         return sql, False
     
-    if not re.search(r"ST_AsGeoJSON.*::json|geojson", sql, flags=re.IGNORECASE):
+    # Consider ST_AsGeoJSON cast to json or jsonb, or a column aliased as geojson
+    if not re.search(r"ST_AsGeoJSON.*::(?:json|jsonb)|\bgeojson\b", sql, flags=re.IGNORECASE):
         return sql, False
     
     # Extract SELECT clause
@@ -683,7 +729,20 @@ def _convert_geom_to_geojson_in_select(sql: str) -> Tuple[str, bool]:
     def _repl(mm: re.Match) -> str:
         prefix = mm.group(1) or ""
         geom_ref = mm.group(2)  # This includes the alias if present (e.g., "a.geom" or "geom")
-        return f"{prefix}ST_AsGeoJSON({geom_ref})::json AS geojson"
+        # If geom_ref is unqualified (no dot) and a FROM alias exists, qualify it to avoid ambiguity
+        if '.' not in geom_ref:
+            # Only treat a token as a FROM alias if it's followed by a SQL clause/token
+            # such as JOIN/WHERE/ORDER/GROUP/HAVING/LIMIT/UNION. This avoids accidentally
+            # capturing SQL keywords like WHERE as an alias (which would produce e.g. WHERE.geom).
+            from_alias_m = re.search(
+                r"FROM\s+counties\s+([a-zA-Z_][a-zA-Z0-9_]*)(?:\s+(?:JOIN|WHERE|ORDER|GROUP|HAVING|LIMIT|UNION))",
+                sql,
+                flags=re.IGNORECASE,
+            )
+            if from_alias_m:
+                geom_ref = f"{from_alias_m.group(1)}.{geom_ref}"
+        # Cast to jsonb instead of json so DISTINCT/GROUP operations have sensible equality semantics
+        return f"{prefix}ST_AsGeoJSON({geom_ref})::jsonb AS geojson"
 
     new_select = pattern.sub(_repl, select_clause)
     if new_select == select_clause:
@@ -977,7 +1036,7 @@ def answer_query(nl_query: str, model: Optional[str] = None, provider: Optional[
     try:
         system_prompt = build_system_prompt()
         log.system_prompt_hash = sha1(system_prompt)
-        lm_text, lm_ms, eff_model = call_lm(system_prompt, nl_query, model=model, provider=provider)
+        lm_text, lm_ms, eff_model = safe_call_lm(system_prompt, nl_query, model=model, provider=provider)
         log.lm_model = eff_model
         log.lm_duration_ms = lm_ms
         log.lm_raw_response = lm_text
@@ -1081,7 +1140,7 @@ def answer_query(nl_query: str, model: Optional[str] = None, provider: Optional[
             )
             system_prompt_retry = build_system_prompt(schema_tips=tip)
             log.system_prompt_hash = sha1(system_prompt_retry)
-            lm_text2, lm_ms2, eff_model2 = call_lm(system_prompt_retry, nl_query, model=model, provider=provider)
+            lm_text2, lm_ms2, eff_model2 = safe_call_lm(system_prompt_retry, nl_query, model=model, provider=provider)
             log.lm_model = eff_model2
             log.lm_duration_ms += lm_ms2
             log.lm_raw_response = f"{log.lm_raw_response}\n--- VALIDATION RETRY RESPONSE ---\n{lm_text2}"
@@ -1146,8 +1205,148 @@ def answer_query(nl_query: str, model: Optional[str] = None, provider: Optional[
         # If the result includes GeoJSON and the total size is modest, return all rows
         # so the frontend can visualize every feature (not just the first 20).
         has_geojson = bool(rows) and isinstance(rows[0], dict) and ("geojson" in rows[0])
-        preview = rows if (has_geojson and len(rows) <= 500) else rows[:20]
 
+        # Special post-processing: if the NL asks for a largest/smallest state and the
+        # query returned a single state (e.g., column stateaabrv) without geometry,
+        # follow up by visualizing that state's counties so the frontend can render a map.
+        # State size/rank visualization fallback: trigger if original result lacks geometry OR
+        # if it has a single geometry row that is clearly not a county listing (missing namelsad)
+        if rows and isinstance(rows[0], dict):
+            q_low = nl_query.lower()
+            wants_state_rank = (
+                ("which state" in q_low or "what state" in q_low or "largest state" in q_low or "biggest state" in q_low or "smallest state" in q_low)
+                and ("county" not in q_low)
+            )
+            if wants_state_rank and (
+                (not has_geojson) or  # no geometry yet
+                (len(rows) == 1 and 'namelsad' not in rows[0])  # single non-county geometry row
+            ):
+                state_code = None
+                # Prefer two-letter abbreviation column
+                if "stateaabrv" in rows[0]:
+                    val = rows[0]["stateaabrv"]
+                    if isinstance(val, str) and len(val.strip()) == 2:
+                        state_code = val.strip().upper()
+                # If LM returned a full state name (e.g., upper_state or name), map it
+                if not state_code:
+                    for key in ("upper_state", "state", "name"):
+                        if key in rows[0]:
+                            val = rows[0][key]
+                            if isinstance(val, str):
+                                abbr = STATE_NAME_TO_ABBR.get(val.strip().upper())
+                                if abbr:
+                                    state_code = abbr
+                                    break
+                if state_code:
+                    viz_sql = (
+                        "SELECT namelsad, stateaabrv, ST_AsGeoJSON(geom)::jsonb AS geojson "
+                        f"FROM counties WHERE stateaabrv='{state_code}' ORDER BY namelsad LIMIT 500"
+                    )
+                    try:
+                        rows2, db_ms2 = run_sql(viz_sql)
+                        log.db_duration_ms = db_ms2
+                        log.row_count = len(rows2)
+                        log.sql_final = viz_sql
+                        reason = "post_visualize_state_counties"
+                        log.sql_rewrite_reason = (log.sql_rewrite_reason + ", " if log.sql_rewrite_reason else "") + reason
+                        write_log(log)
+                        return answer_for_rows(rows2, viz_sql, db_ms2, lm_ms=log.lm_duration_ms)
+                    except Exception:
+                        pass
+
+        # Generic visualization fallback: if we have a small tabular result without geojson,
+        # try to visualize by resolving county identities present in the result (geoid/name/namelsad+state).
+        if (not has_geojson) and rows and isinstance(rows[0], dict):
+            # Only attempt when the result set is small to avoid expensive expansions
+            if len(rows) <= 50:
+                def _esc(v: str) -> str:
+                    return v.replace("'", "''")
+
+                viz_sql = None
+                first = rows[0]
+                # Case 1: rows include geoid values
+                if 'geoid' in first:
+                    geoids = [str(r['geoid']) for r in rows if r.get('geoid')]
+                    if geoids:
+                        in_list = ", ".join(f"'{_esc(g)}'" for g in geoids[:500])
+                        viz_sql = (
+                            "SELECT namelsad, stateaabrv, geoid, ST_AsGeoJSON(geom)::jsonb AS geojson "
+                            f"FROM counties WHERE geoid IN ({in_list}) ORDER BY stateaabrv, namelsad LIMIT 500"
+                        )
+                # Case 2: rows include namelsad and stateaabrv pairs
+                elif 'namelsad' in first and 'stateaabrv' in first:
+                    pairs = [(r['namelsad'], r['stateaabrv']) for r in rows if r.get('namelsad') and r.get('stateaabrv')]
+                    if pairs:
+                        ors = [
+                            f"(namelsad='{_esc(n)}' AND stateaabrv='{_esc(s).upper()}')"
+                            for (n, s) in pairs[:200]
+                        ]
+                        cond = " OR ".join(ors)
+                        viz_sql = (
+                            "SELECT namelsad, stateaabrv, geoid, ST_AsGeoJSON(geom)::jsonb AS geojson "
+                            f"FROM counties WHERE {cond} ORDER BY stateaabrv, namelsad LIMIT 500"
+                        )
+                # Case 3: rows include base county name column (e.g., name from aggregations)
+                elif 'name' in first:
+                    names = [r['name'] for r in rows if r.get('name')]
+                    if names:
+                        in_list = ", ".join(f"'{_esc(str(n))}'" for n in names[:50])
+                        viz_sql = (
+                            "SELECT namelsad, stateaabrv, geoid, ST_AsGeoJSON(geom)::jsonb AS geojson "
+                            f"FROM counties WHERE name IN ({in_list}) ORDER BY stateaabrv, namelsad LIMIT 500"
+                        )
+
+                if viz_sql:
+                    try:
+                        rows_v, db_ms_v = run_sql(viz_sql)
+                        if rows_v:
+                            log.db_duration_ms = db_ms_v
+                            log.row_count = len(rows_v)
+                            log.sql_final = viz_sql
+                            reason = "post_visualize_by_identity"
+                            log.sql_rewrite_reason = (log.sql_rewrite_reason + ", " if log.sql_rewrite_reason else "") + reason
+                            write_log(log)
+                            return answer_for_rows(rows_v, viz_sql, db_ms_v, lm_ms=log.lm_duration_ms)
+                    except Exception:
+                        pass
+
+        # Fallback 2: derive WHERE clause from the issued SQL that selected from counties
+        if (not has_geojson) and rows and isinstance(rows[0], dict):
+            sql_l = log.sql_final.lower()
+            if " from " in sql_l and " from counties" in sql_l and " where " in sql_l:
+                import re as _re
+                # Capture optional alias after counties
+                m_from = _re.search(r"\bfrom\s+counties\s+(?:as\s+)?([a-zA-Z_][\w]*)?", sql_l)
+                alias = m_from.group(1) if m_from else None
+                i_where = sql_l.find(" where ")
+                # Determine the end of the WHERE clause
+                next_kw_positions = []
+                for kw in [" group by ", " order by ", " limit ", " union ", ";"]:
+                    j = sql_l.find(kw, i_where + 7)
+                    if j != -1:
+                        next_kw_positions.append(j)
+                end_where = min(next_kw_positions) if next_kw_positions else len(sql_l)
+                where_clause = log.sql_final[i_where + len(" where "): end_where].strip()
+                if alias:
+                    where_clause = where_clause.replace(f"{alias}.", "")
+                viz_sql2 = (
+                    "SELECT namelsad, stateaabrv, geoid, ST_AsGeoJSON(geom)::jsonb AS geojson "
+                    f"FROM counties WHERE {where_clause} ORDER BY stateaabrv, namelsad LIMIT 500"
+                )
+                try:
+                    rows_v2, db_ms_v2 = run_sql(viz_sql2)
+                    if rows_v2:
+                        log.db_duration_ms = db_ms_v2
+                        log.row_count = len(rows_v2)
+                        log.sql_final = viz_sql2
+                        reason = "post_visualize_by_where"
+                        log.sql_rewrite_reason = (log.sql_rewrite_reason + ", " if log.sql_rewrite_reason else "") + reason
+                        write_log(log)
+                        return answer_for_rows(rows_v2, viz_sql2, db_ms_v2, lm_ms=log.lm_duration_ms)
+                except Exception:
+                    pass
+
+        preview = rows if (has_geojson and len(rows) <= 500) else rows[:20]
         ans = Answer(
             ok=True,
             rows_preview=preview,
@@ -1179,7 +1378,7 @@ def answer_query(nl_query: str, model: Optional[str] = None, provider: Optional[
             tip = extract_schema_tip(first_db_error)
             system_prompt_retry = build_system_prompt(schema_tips=tip)
             log.system_prompt_hash = sha1(system_prompt_retry)
-            lm_text2, lm_ms2, eff_model2 = call_lm(system_prompt_retry, nl_query, model=model, provider=provider)
+            lm_text2, lm_ms2, eff_model2 = safe_call_lm(system_prompt_retry, nl_query, model=model, provider=provider)
             log.lm_model = eff_model2
             log.lm_duration_ms += lm_ms2
             log.lm_raw_response = f"{log.lm_raw_response}\n--- RETRY 1 RESPONSE ---\n{lm_text2}"
