@@ -3,7 +3,7 @@ import USMap from './components/USMap';
 import CountyInfo from './components/CountyInfo';
 import ErrorLogger from './components/ErrorLogger';
 import QueryBar from './components/QueryBar';
-import { postAnswer, getCountyByGeoid, type BackendAnswer } from './api';
+import { getCountyByGeoid, type BackendAnswer } from './api';
 import type { County } from './types';
 import type { Feature, Geometry } from 'geojson';
 import HistoryPanel from './components/HistoryPanel.tsx';
@@ -24,8 +24,6 @@ const App: React.FC = () => {
   const [selectedCounty, setSelectedCounty] = useState<County | null>(null);
   const [errorLogs, setErrorLogs] = useState<string[]>([]);
   const [overlayFeatures, setOverlayFeatures] = useState<Feature<Geometry, any>[]>([]);
-  const [lastSQL, setLastSQL] = useState<string | null>(null);
-  const [lastMetrics, setLastMetrics] = useState<{ lm_ms: number; db_ms: number } | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
 
@@ -56,15 +54,13 @@ const App: React.FC = () => {
       }
       const feats = rowsToFeatures(ans.rows_preview);
       setOverlayFeatures(feats);
-      setLastSQL(ans.sql ?? null);
-      setLastMetrics({ lm_ms: ans.lm_ms, db_ms: ans.db_ms });
 
       // Enrich selected county with name/state from the first result row when available
       const first = ans.rows_preview?.[0] || {} as any;
       const enriched: County = {
         id: county.id,
         name: (first.namelsad || first.name || undefined) as string | undefined,
-        state: (first.stateabbrev || first.stateabbrv || first.state || undefined) as string | undefined,
+        state: (first.stateaabrv || first.stateabbrv || first.stateabbrev || first.state || undefined) as string | undefined,
       };
       setSelectedCounty(enriched);
 
@@ -108,10 +104,10 @@ const App: React.FC = () => {
             handleError(ans.error || 'Backend returned ok=false');
             return;
           }
+          // Clear any previously selected county when a new result arrives
+          setSelectedCounty(null);
           const feats = rowsToFeatures(ans.rows_preview);
           setOverlayFeatures(feats);
-          setLastSQL(ans.sql ?? null);
-          setLastMetrics({ lm_ms: ans.lm_ms, db_ms: ans.db_ms });
 
           const entry: HistoryEntry = {
             id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -148,27 +144,21 @@ const App: React.FC = () => {
             selectedId={selectedHistoryId}
             onSelect={(id) => {
               setSelectedHistoryId(id);
+              // Clear any previously selected county when switching history views
+              setSelectedCounty(null);
               const item = history.find(h => h.id === id);
               if (item) {
                 setOverlayFeatures(item.overlayFeatures);
-                setLastSQL(item.answer.sql ?? null);
-                setLastMetrics({ lm_ms: item.answer.lm_ms, db_ms: item.answer.db_ms });
               }
             }}
             onClear={() => {
               setHistory([]);
               setSelectedHistoryId(null);
+              // Also clear selection & overlays when history is cleared
+              setSelectedCounty(null);
+              setOverlayFeatures([]);
             }}
           />
-          {lastSQL && (
-            <div className="p-3 text-xs text-gray-300 border-t border-cyan-500/30">
-              <div className="font-semibold text-cyan-400 mb-1">Current SQL</div>
-              <pre className="whitespace-pre-wrap break-words">{lastSQL}</pre>
-              {lastMetrics && (
-                <div className="mt-2 text-gray-400">LM: {lastMetrics.lm_ms} ms • DB: {lastMetrics.db_ms} ms</div>
-              )}
-            </div>
-          )}
           <ErrorLogger logs={errorLogs} onClear={clearErrorLogs} />
         </aside>
       </div>
